@@ -50,7 +50,6 @@ class GoogleDriveProvider extends CloudStorageProvider {
     bool forceInteractive = false,
     List<String>? scopes,
     String? serverClientId,
-    String? clientId,
     String? clientSecret, // Secret is needed for the web app flow on desktop
      int redirectPort = 8000, // Default port used by the package
   }) async {

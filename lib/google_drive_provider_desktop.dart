@@ -42,7 +42,6 @@ class GoogleDriveProviderDesktop extends GoogleDriveProvider {
     List<String>? scopes,
     // NEW: Client ID and Secret are required for the desktop flow.
     String? serverClientId,
-    String? clientId,
     String? clientSecret, // Secret is needed for the web app flow on desktop
     int redirectPort = 8000, // Default port used by the package
   }) async {
@@ -57,7 +56,7 @@ class GoogleDriveProviderDesktop extends GoogleDriveProvider {
     try {
       // 1. CONFIGURE: The new package uses a parameters object for configuration.
       final signInParams = all_platforms.GoogleSignInParams(
-        clientId: clientId,
+        clientId: serverClientId,
         clientSecret: clientSecret, // May be null for other client types
         scopes: GoogleDriveProvider.scopes,
         redirectPort: redirectPort,
