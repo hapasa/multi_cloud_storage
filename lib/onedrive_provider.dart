@@ -87,20 +87,65 @@ class OneDriveProvider extends CloudStorageProvider {
   }) {
     return _executeRequest(
       () async {
-        final files = await client.listFiles(path,
-            recursive: recursive,
-            isAppFolder:
-                MultiCloudStorage.cloudAccess == CloudAccessType.appStorage);
-        // Map the OneDrive-specific file objects to the generic CloudFile model.
-        return files
-            .map((oneDriveFile) => CloudFile(
-                path: oneDriveFile.path,
-                name: oneDriveFile.name,
-                size: oneDriveFile.size,
-                modifiedTime:
-                    DateTime.now(), // HACK: SDK does not provide this field.
-                isDirectory: oneDriveFile.isFolder))
-            .toList();
+        final accessToken = await _getAccessToken();
+        if (accessToken.isEmpty) {
+          throw Exception('No access token available for listing files.');
+        }
+
+        // Build the correct endpoint based on whether we're using app folder or full drive access
+        final String endpoint;
+        final isAppFolder = MultiCloudStorage.cloudAccess == CloudAccessType.appStorage;
+
+        if (path.isEmpty || path == '/') {
+          // List root folder contents
+          if (isAppFolder) {
+            endpoint = 'https://graph.microsoft.com/v1.0/me/drive/special/approot/children';
+          } else {
+            endpoint = 'https://graph.microsoft.com/v1.0/me/drive/root/children';
+          }
+        } else {
+          // List specific folder contents
+          // Normalize path: remove leading slash for Graph API path encoding
+          final normalizedPath = path.startsWith('/') ? path.substring(1) : path;
+          final encodedPath = Uri.encodeComponent(normalizedPath);
+          if (isAppFolder) {
+            endpoint = 'https://graph.microsoft.com/v1.0/me/drive/special/approot:/$encodedPath:/children';
+          } else {
+            endpoint = 'https://graph.microsoft.com/v1.0/me/drive/root:/$encodedPath:/children';
+          }
+        }
+
+        final response = await http.get(
+          Uri.parse(endpoint),
+          headers: {'Authorization': 'Bearer $accessToken'},
+        );
+
+        if (response.statusCode == 404) {
+          // Folder doesn't exist, return empty list
+          return <CloudFile>[];
+        }
+
+        if (response.statusCode != 200) {
+          throw Exception(
+              'Failed to list files at $path: ${response.statusCode} - ${response.body}');
+        }
+
+        final json = jsonDecode(response.body);
+        final items = json['value'] as List<dynamic>? ?? [];
+
+        // Map the Graph API response items to CloudFile objects
+        final files = items.map((item) => _mapGraphItemToCloudFile(item as Map<String, dynamic>)).toList();
+
+        // Handle recursive listing if requested
+        if (recursive) {
+          final folders = files.where((f) => f.isDirectory).toList();
+          for (final folder in folders) {
+            final subFiles = await listFiles(path: folder.path, recursive: true);
+            files.addAll(subFiles);
+          }
+        }
+
+        return files;
       },
       operation: 'listFiles at $path',
     );
@@ -192,15 +237,85 @@ class OneDriveProvider extends CloudStorageProvider {
     );
   }
 
-  /// File Metadata not supported since flutter_onedrive does not provide it.
+  /// Retrieves metadata for a file or directory at the specified [path].
   @override
   Future<CloudFile> getFileMetadata(String path) {
     return _executeRequest(
       () async {
-        // The underlying package doesn't have a dedicated metadata fetch method.
-        throw UnimplementedError('Get metadata functionality not implemented');
+        final accessToken = await _getAccessToken();
+        if (accessToken.isEmpty) {
+          throw Exception('No access token available for getting metadata.');
+        }
+
+        // Normalize path: remove leading slash for Graph API path encoding
+        final normalizedPath = path.startsWith('/') ? path.substring(1) : path;
+        final encodedPath = Uri.encodeComponent(normalizedPath);
+
+        // Build the correct endpoint based on whether we're using app folder or full drive access
+        final String endpoint;
+        if (MultiCloudStorage.cloudAccess == CloudAccessType.appStorage) {
+          endpoint =
+              'https://graph.microsoft.com/v1.0/me/drive/special/approot:/$encodedPath';
+        } else {
+          endpoint =
+              'https://graph.microsoft.com/v1.0/me/drive/root:/$encodedPath';
+        }
+
+        final response = await http.get(
+          Uri.parse(endpoint),
+          headers: {'Authorization': 'Bearer $accessToken'},
+        );
+
+        if (response.statusCode == 404) {
+          throw NotFoundException('File not found: $path');
+        }
+
+        if (response.statusCode != 200) {
+          throw Exception(
+              'Failed to get metadata for $path: ${response.statusCode} - ${response.body}');
+        }
+
+        final json = jsonDecode(response.body);
+        return _mapGraphItemToCloudFile(json);
       },
       operation: 'getFileMetadata for $path',
+    );
+  }
+
+  /// Maps a Microsoft Graph API drive item response to a CloudFile object.
+  CloudFile _mapGraphItemToCloudFile(Map<String, dynamic> item) {
+    final name = item['name'] as String? ?? '';
+    // parentReference.path gives us the parent folder path
+    final parentPath = item['parentReference']?['path'] as String? ?? '';
+    // Extract the relative path from the full parent path (remove drive root prefix)
+    String relativePath = '';
+    if (parentPath.isNotEmpty) {
+      // The path format is typically: /drive/root:/folder/path or /drive/root:
+      final rootMarkerIndex = parentPath.indexOf(':');
+      if (rootMarkerIndex != -1 && rootMarkerIndex < parentPath.length - 1) {
+        relativePath = parentPath.substring(rootMarkerIndex + 1);
+      }
+    }
+    final fullPath =
+        relativePath.isEmpty ? '/$name' : '$relativePath/$name';
+
+    final isFolder = item.containsKey('folder');
+    final size = item['size'] as int?;
+
+    // Parse the lastModifiedDateTime field
+    DateTime? modifiedTime;
+    final lastModified = item['lastModifiedDateTime'] as String?;
+    if (lastModified != null) {
+      modifiedTime = DateTime.tryParse(lastModified);
+    }
+
+    return CloudFile(
+      path: fullPath,
+      name: name,
+      size: isFolder ? null : size,
+      modifiedTime: modifiedTime,
+      isDirectory: isFolder,
+      metadata: item,
     );
   }
 
