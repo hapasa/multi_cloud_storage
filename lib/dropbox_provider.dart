@@ -7,7 +7,9 @@ import 'package:app_links/app_links.dart';
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:path/path.dart' as p;
 import 'package:url_launcher/url_launcher.dart';
 
@@ -16,10 +18,14 @@ import 'exceptions/no_connection_exception.dart';
 import 'exceptions/not_found_exception.dart';
 
 class DropboxProvider extends CloudStorageProvider {
+  static const String _scopedAuthorizationScope =
+      'account_info.read files.content.read files.content.write sharing.write';
+
   // --- Configuration Properties ---
   final String _appKey;
   final String _appSecret;
   final String _redirectUri;
+  final bool _includeAuthorizationScope;
 
   // --- Token storage ---
   final _secureStorage = const FlutterSecureStorage();
@@ -37,9 +43,11 @@ class DropboxProvider extends CloudStorageProvider {
     required String appKey,
     required String appSecret,
     required String redirectUri,
+    required bool includeAuthorizationScope,
   })  : _appKey = appKey,
         _appSecret = appSecret,
-        _redirectUri = redirectUri {
+        _redirectUri = redirectUri,
+        _includeAuthorizationScope = includeAuthorizationScope {
     _initializeDio();
   }
 
@@ -49,6 +57,7 @@ class DropboxProvider extends CloudStorageProvider {
     required String appKey,
     required String appSecret,
     required String redirectUri,
+    bool includeAuthorizationScope = true,
     bool forceInteractive = false,
   }) async {
     debugPrint('connect Dropbox, forceInteractive: $forceInteractive');
@@ -59,7 +68,10 @@ class DropboxProvider extends CloudStorageProvider {
     }
     try {
       final provider = DropboxProvider._create(
-          appKey: appKey, appSecret: appSecret, redirectUri: redirectUri);
+          appKey: appKey,
+          appSecret: appSecret,
+          redirectUri: redirectUri,
+          includeAuthorizationScope: includeAuthorizationScope);
       // If interactive login is forced, clear any existing credentials.
       if (forceInteractive) {
         debugPrint('Forcing interactive login, clearing existing token.');
@@ -499,6 +511,54 @@ class DropboxProvider extends CloudStorageProvider {
 
   /// Manages the interactive OAuth2 flow using a web view and app links.
   Future<String?> _getAuthCodeViaInteractiveFlow() async {
+    if (Platform.isIOS) {
+      return _getAuthCodeViaWebAuth2();
+    }
+
+    return _getAuthCodeViaAppLinks();
+  }
+
+  Future<String?> _getAuthCodeViaWebAuth2() async {
+    final authUrl = _getAuthorizationUrl();
+    final redirectUri = Uri.parse(_redirectUri);
+    debugPrint('Launching Dropbox authorization URL via WebAuth2: $authUrl');
+
+    try {
+      final callbackUrl = await FlutterWebAuth2.authenticate(
+        url: authUrl,
+        callbackUrlScheme: redirectUri.scheme,
+      );
+      final callbackUri = Uri.parse(callbackUrl);
+      final expectedPath = redirectUri.path.isEmpty ? '/' : redirectUri.path;
+      final actualPath = callbackUri.path.isEmpty ? '/' : callbackUri.path;
+
+      if (callbackUri.scheme != redirectUri.scheme ||
+          callbackUri.host != redirectUri.host ||
+          actualPath != expectedPath) {
+        debugPrint(
+            'Dropbox auth returned unexpected callback target ${callbackUri.scheme}://${callbackUri.host}$actualPath expected ${redirectUri.scheme}://${redirectUri.host}$expectedPath');
+        return null;
+      }
+
+      final code = callbackUri.queryParameters['code'];
+      if (code != null && code.isNotEmpty) {
+        debugPrint('Received authorization code from WebAuth2 redirect.');
+        return code;
+      }
+
+      final error = callbackUri.queryParameters['error_description'] ??
+          callbackUri.queryParameters['error'] ??
+          'Unknown error';
+      debugPrint('Dropbox auth failed from WebAuth2 redirect: $error');
+      return null;
+    } on PlatformException catch (error) {
+      debugPrint(
+          'Dropbox WebAuth2 auth cancelled or failed code=${error.code} message=${error.message}');
+      return null;
+    }
+  }
+
+  Future<String?> _getAuthCodeViaAppLinks() async {
     final authUrl = _getAuthorizationUrl();
     final uri = Uri.parse(authUrl);
     final codeCompleter = Completer<String?>();
@@ -621,9 +681,10 @@ class DropboxProvider extends CloudStorageProvider {
       'token_access_type': 'offline', // To get a refresh token
       'code_challenge_method': 'S256',
       'code_challenge': _generateCodeChallengeS256(_pkceCodeVerifier!),
-      'scope':
-          'account_info.read files.content.read files.content.write sharing.write',
     };
+    if (_includeAuthorizationScope) {
+      queryParams['scope'] = _scopedAuthorizationScope;
+    }
     return Uri.https('www.dropbox.com', '/oauth2/authorize', queryParams)
         .toString();
   }

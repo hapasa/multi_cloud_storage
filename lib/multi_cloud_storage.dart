@@ -8,7 +8,6 @@ import 'package:multi_cloud_storage/icloud_provider.dart';
 import 'package:multi_cloud_storage/onedrive_provider.dart';
 
 import 'dropbox_provider.dart';
-import 'google_drive_provider.dart';
 
 export 'cloud_storage_provider.dart';
 
@@ -19,11 +18,13 @@ class MultiCloudStorage {
           {required String appKey,
           required String appSecret,
           required String redirectUri,
+        bool includeAuthorizationScope = true,
           bool forceInteractive = false}) =>
       DropboxProvider.connect(
           appKey: appKey,
           appSecret: appSecret,
           redirectUri: redirectUri,
+        includeAuthorizationScope: includeAuthorizationScope,
           forceInteractive: forceInteractive);
 
   static Future<CloudStorageProvider?> connectToGoogleDrive(
