@@ -1,10 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_onedrive/flutter_onedrive.dart';
 import 'package:flutter_onedrive/token.dart';
+import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:http/http.dart' as http;
+import 'package:oauth2/oauth2.dart' as oauth2;
 import 'cloud_storage_provider.dart';
 import 'exceptions/no_connection_exception.dart';
 import 'multi_cloud_storage.dart';
@@ -13,6 +17,9 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'exceptions/not_found_exception.dart';
 
 class OneDriveProvider extends CloudStorageProvider {
+  static const String _pkceCharset =
+      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+
   late OneDrive client;
   bool _isAuthenticated = false;
   final String clientId;
@@ -44,27 +51,51 @@ class OneDriveProvider extends CloudStorageProvider {
           'https://login.microsoftonline.com/common/oauth2/nativeclient';
     }
     try {
+      final effectiveScopes = scopes ??
+          "${MultiCloudStorage.cloudAccess == CloudAccessType.appStorage ? OneDrive.permissionFilesReadWriteAppFolder : OneDrive.permissionFilesReadWriteAll} offline_access User.Read Sites.ReadWrite.All";
+      debugPrint(
+          'OneDriveProvider.connect: start clientId=$clientId redirectUri=$redirectUri cloudAccess=${MultiCloudStorage.cloudAccess}');
+      debugPrint('OneDriveProvider.connect: scopes=$effectiveScopes');
       final provider = OneDriveProvider._create(
           clientId: clientId, redirectUri: redirectUri, context: context);
+      final tokenManager = DefaultTokenManager(
+        tokenEndpoint: OneDrive.tokenEndpoint,
+        clientID: clientId,
+        redirectURL: redirectUri,
+        scope: effectiveScopes,
+      );
       // Configure the client with appropriate scopes based on the desired access level.
       provider.client = OneDrive(
         clientID: clientId,
         redirectURL: redirectUri,
-        scopes: scopes ??
-            "${MultiCloudStorage.cloudAccess == CloudAccessType.appStorage ? OneDrive.permissionFilesReadWriteAppFolder : OneDrive.permissionFilesReadWriteAll} offline_access User.Read Sites.ReadWrite.All",
+        scopes: effectiveScopes,
+        tokenManager: tokenManager,
       );
       // 1. First, attempt to connect silently using a stored token.
-      if (await provider.client.isConnected()) {
+      final isSilentlyConnected = await provider.client.isConnected();
+      debugPrint(
+          'OneDriveProvider.connect: client.isConnected() => $isSilentlyConnected');
+      if (isSilentlyConnected) {
         provider._isAuthenticated = true;
         debugPrint("OneDriveProvider: Silently connected successfully.");
         return provider;
       }
-      // 2. If silent connection fails, fall back to interactive login via a WebView.
+        // 2. If silent connection fails, fall back to interactive login.
       debugPrint(
           "OneDriveProvider: Not connected, attempting interactive login...");
-      if (await provider.client.connect(context) == false) {
+      final interactiveConnected = Platform.isAndroid || Platform.isIOS
+          ? await _connectInteractivelyWithPkce(
+              clientId: clientId,
+              redirectUri: redirectUri,
+              scopes: effectiveScopes,
+              tokenManager: tokenManager,
+            )
+          : await provider.client.connect(context);
+      debugPrint(
+          'OneDriveProvider.connect: interactive login result => $interactiveConnected');
+      if (interactiveConnected == false) {
         debugPrint(
-            "OneDriveProvider: Interactive login failed or was cancelled.");
+            'OneDriveProvider: Interactive login failed or was cancelled for redirectUri=$redirectUri');
         return null; // User cancelled or login failed.
       }
       provider._isAuthenticated = true;
@@ -73,10 +104,82 @@ class OneDriveProvider extends CloudStorageProvider {
     } on SocketException catch (e) {
       debugPrint('No connection detected.');
       throw NoConnectionException(e.message);
-    } catch (e) {
-      debugPrint('Exception ${e.toString()}');
+    } catch (e, stackTrace) {
+      debugPrint('OneDriveProvider.connect: exception $e');
+      debugPrint('OneDriveProvider.connect: stackTrace $stackTrace');
       rethrow;
     }
+  }
+
+  static Future<bool> _connectInteractivelyWithPkce({
+    required String clientId,
+    required String redirectUri,
+    required String scopes,
+    required ITokenManager tokenManager,
+  }) async {
+    final redirect = Uri.parse(redirectUri);
+    final codeVerifier = _generateCodeVerifier();
+    final grant = oauth2.AuthorizationCodeGrant(
+      clientId,
+      Uri.https(OneDrive.authHost, OneDrive.authEndpoint),
+      Uri.parse(OneDrive.tokenEndpoint),
+      codeVerifier: codeVerifier,
+      basicAuth: false,
+    );
+    final authUrl = grant.getAuthorizationUrl(
+      redirect,
+      scopes: scopes.split(' '),
+    );
+
+    debugPrint(
+        'OneDriveProvider._connectInteractivelyWithPkce: authUrl=$authUrl');
+
+    try {
+      final callbackUrl = await FlutterWebAuth2.authenticate(
+        url: authUrl.toString(),
+        callbackUrlScheme: redirect.scheme,
+      );
+      debugPrint(
+          'OneDriveProvider._connectInteractivelyWithPkce: callbackUrl=$callbackUrl');
+
+      final callbackUri = Uri.parse(callbackUrl);
+      if (callbackUri.scheme != redirect.scheme ||
+          callbackUri.host != redirect.host ||
+          callbackUri.path != redirect.path) {
+        debugPrint(
+            'OneDriveProvider._connectInteractivelyWithPkce: unexpected callback target ${callbackUri.scheme}://${callbackUri.host}${callbackUri.path} expected ${redirect.scheme}://${redirect.host}${redirect.path}');
+        return false;
+      }
+
+      final client = await grant.handleAuthorizationResponse(
+        callbackUri.queryParameters,
+      );
+      await tokenManager.saveTokenResp(client.credentials);
+      debugPrint(
+          'OneDriveProvider._connectInteractivelyWithPkce: token exchange succeeded');
+      return true;
+    } on PlatformException catch (error) {
+      debugPrint(
+          'OneDriveProvider._connectInteractivelyWithPkce: platform exception code=${error.code} message=${error.message}');
+      return false;
+    } on oauth2.AuthorizationException catch (error) {
+      debugPrint(
+          'OneDriveProvider._connectInteractivelyWithPkce: authorization exception error=${error.error} description=${error.description}');
+      return false;
+    } catch (error, stackTrace) {
+      debugPrint(
+          'OneDriveProvider._connectInteractivelyWithPkce: exception $error');
+      debugPrint(
+          'OneDriveProvider._connectInteractivelyWithPkce: stackTrace $stackTrace');
+      return false;
+    }
+  }
+
+  static String _generateCodeVerifier() {
+    return List.generate(
+      128,
+      (_) => _pkceCharset[Random.secure().nextInt(_pkceCharset.length)],
+    ).join();
   }
 
   /// Lists all files and directories at the specified [path].
@@ -370,28 +473,29 @@ class OneDriveProvider extends CloudStorageProvider {
   /// Logs out the current user from the cloud service.
   @override
   Future<bool> logout() async {
-    debugPrint("Logging out from OneDrive...");
+    debugPrint(
+        'OneDriveProvider.logout: start isAuthenticated=$_isAuthenticated redirectUri=$redirectUri');
     final cookieManager = CookieManager.instance();
     if (_isAuthenticated) {
       try {
         // 1. Disconnect the client to clear local tokens.
         await client.disconnect();
+        debugPrint('OneDriveProvider.logout: client.disconnect() completed');
         _isAuthenticated = false;
         // 2. Clear all WebView cookies to ensure a fresh login prompt on the next connect attempt.
         await cookieManager.deleteAllCookies();
-        debugPrint("OneDrive logout successful and web cookies cleared.");
+        debugPrint(
+            'OneDriveProvider.logout: web cookies cleared after disconnect');
         return true;
       } catch (error) {
-        debugPrint(
-          "Error during OneDrive logout.",
-        );
+        debugPrint('OneDriveProvider.logout: error during logout $error');
         return false;
       }
     }
     // Ensure cookies are cleared even if the client was already disconnected.
     await cookieManager.deleteAllCookies();
     debugPrint(
-        "Already logged out from OneDrive, ensuring cookies are cleared.");
+        'OneDriveProvider.logout: already disconnected, cleared web cookies only');
     return false;
   }
 
