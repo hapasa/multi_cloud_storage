@@ -426,7 +426,8 @@ class GoogleDriveProvider extends CloudStorageProvider {
       return await request();
     } on drive.DetailedApiRequestError catch (e, stackTrace) {
       // If the error is an auth token issue, try to recover.
-      if (e.status == 401 || e.status == 403) {
+      if (e.status == 401 ||
+          (e.status == 403 && !_isExportOnlyForbiddenError(e))) {
         return handleAuthErrorAndRetry(request, e, stackTrace);
       } else if (e.status == 404) {
         throw NotFoundException(e.message ?? '');
@@ -455,6 +456,16 @@ class GoogleDriveProvider extends CloudStorageProvider {
       throw Exception(
           'GoogleDriveProvider: Not authenticated. Call connect() first.');
     }
+  }
+
+  bool _isExportOnlyForbiddenError(drive.DetailedApiRequestError error) {
+    final message = error.message?.toLowerCase();
+    if (message == null) {
+      return false;
+    }
+
+    return message.contains('only files with binary content can be downloaded') ||
+        message.contains('use export with docs editors files');
   }
 
   /// A helper to handle auth errors by reconnecting and retrying the request.
