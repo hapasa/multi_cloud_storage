@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_onedrive/flutter_onedrive.dart';
 import 'package:flutter_onedrive/token.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:http/http.dart' as http;
 import 'package:oauth2/oauth2.dart' as oauth2;
@@ -16,22 +17,132 @@ import 'package:dio/dio.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'exceptions/not_found_exception.dart';
 
+enum OneDriveAuthFailureCode {
+  callbackMismatch,
+  tokenExchangeFailed,
+  tokenCacheUnavailable,
+  graphProbeFailed,
+}
+
+class OneDriveAuthException implements Exception {
+  const OneDriveAuthException(
+    this.code,
+    this.message, {
+    this.cause,
+  });
+
+  final OneDriveAuthFailureCode code;
+  final String message;
+  final Object? cause;
+
+  @override
+  String toString() => 'OneDriveAuthException(code: $code, message: $message, cause: $cause)';
+}
+
+abstract class OneDriveCredentialPersistence {
+  Future<String?> read(String key);
+
+  Future<void> write(String key, String value);
+
+  Future<void> delete(String key);
+}
+
+class OneDriveSecureStoragePersistence
+    implements OneDriveCredentialPersistence {
+  OneDriveSecureStoragePersistence({FlutterSecureStorage? secureStorage})
+      : _secureStorage = secureStorage ?? const FlutterSecureStorage();
+
+  final FlutterSecureStorage _secureStorage;
+
+  @override
+  Future<String?> read(String key) => _secureStorage.read(key: key);
+
+  @override
+  Future<void> write(String key, String value) =>
+      _secureStorage.write(key: key, value: value);
+
+  @override
+  Future<void> delete(String key) => _secureStorage.delete(key: key);
+}
+
+class OneDriveCredentialStore {
+  OneDriveCredentialStore({OneDriveCredentialPersistence? persistence})
+      : _persistence =
+            persistence ?? OneDriveSecureStoragePersistence();
+
+  static const String _keyPrefix = 'onedrive_credentials';
+
+  final OneDriveCredentialPersistence _persistence;
+
+  @visibleForTesting
+  static String storageKey({
+    required String clientId,
+    required String redirectUri,
+  }) {
+    final encodedRedirect = base64UrlEncode(utf8.encode(redirectUri));
+    return '$_keyPrefix::$clientId::$encodedRedirect';
+  }
+
+  Future<void> save({
+    required String clientId,
+    required String redirectUri,
+    required oauth2.Credentials credentials,
+  }) {
+    return _persistence.write(
+      storageKey(clientId: clientId, redirectUri: redirectUri),
+      credentials.toJson(),
+    );
+  }
+
+  Future<oauth2.Credentials?> load({
+    required String clientId,
+    required String redirectUri,
+  }) async {
+    final key = storageKey(clientId: clientId, redirectUri: redirectUri);
+    final storedJson = await _persistence.read(key);
+    if (storedJson == null || storedJson.isEmpty) {
+      return null;
+    }
+
+    try {
+      return oauth2.Credentials.fromJson(storedJson);
+    } catch (error) {
+      debugPrint(
+          'OneDriveCredentialStore.load: clearing invalid stored credentials for key=$key error=$error');
+      await _persistence.delete(key);
+      return null;
+    }
+  }
+
+  Future<void> clear({
+    required String clientId,
+    required String redirectUri,
+  }) {
+    return _persistence.delete(
+      storageKey(clientId: clientId, redirectUri: redirectUri),
+    );
+  }
+}
+
 class OneDriveProvider extends CloudStorageProvider {
   static const String _pkceCharset =
       'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
 
   late OneDrive client;
+  late final ITokenManager _tokenManager;
   bool _isAuthenticated = false;
   final String clientId;
   final String redirectUri;
   final BuildContext context;
+  final OneDriveCredentialStore _credentialStore;
 
   /// Private constructor to ensure a provider is created via the static [connect] method.
   OneDriveProvider._create({
     required this.clientId,
     required this.redirectUri,
     required this.context,
-  });
+    OneDriveCredentialStore? credentialStore,
+  }) : _credentialStore = credentialStore ?? OneDriveCredentialStore();
 
   /// Connects to OneDrive, handling both silent and interactive authentication.
   static Future<OneDriveProvider?> connect({
@@ -58,7 +169,7 @@ class OneDriveProvider extends CloudStorageProvider {
       debugPrint('OneDriveProvider.connect: scopes=$effectiveScopes');
       final provider = OneDriveProvider._create(
           clientId: clientId, redirectUri: redirectUri, context: context);
-      final tokenManager = DefaultTokenManager(
+      provider._tokenManager = DefaultTokenManager(
         tokenEndpoint: OneDrive.tokenEndpoint,
         clientID: clientId,
         redirectURL: redirectUri,
@@ -69,35 +180,66 @@ class OneDriveProvider extends CloudStorageProvider {
         clientID: clientId,
         redirectURL: redirectUri,
         scopes: effectiveScopes,
-        tokenManager: tokenManager,
+        tokenManager: provider._tokenManager,
       );
-      // 1. First, attempt to connect silently using a stored token.
-      final isSilentlyConnected = await provider.client.isConnected();
+
+      final restoredOwnedSession = await provider._restoreOwnedSession();
+      final isSilentlyConnected = restoredOwnedSession ||
+          await provider.client.isConnected();
       debugPrint(
-          'OneDriveProvider.connect: client.isConnected() => $isSilentlyConnected');
+          'OneDriveProvider.connect: restoredOwnedSession=$restoredOwnedSession client.isConnected() => $isSilentlyConnected');
       if (isSilentlyConnected) {
-        provider._isAuthenticated = true;
-        debugPrint("OneDriveProvider: Silently connected successfully.");
-        return provider;
+        try {
+          await provider._verifyAuthenticatedSession(
+            stage: restoredOwnedSession
+                ? 'owned-credential-restore'
+                : 'plugin-token-cache',
+          );
+          provider._isAuthenticated = true;
+          debugPrint("OneDriveProvider: Silently connected successfully.");
+          return provider;
+        } catch (error) {
+          debugPrint(
+              'OneDriveProvider.connect: silent session verification failed, clearing stored session and retrying interactively. error=$error');
+          await provider._clearStoredSession();
+        }
       }
-        // 2. If silent connection fails, fall back to interactive login.
+
+      // 2. If silent connection fails, fall back to interactive login.
       debugPrint(
           "OneDriveProvider: Not connected, attempting interactive login...");
-      final interactiveConnected = Platform.isAndroid || Platform.isIOS
-          ? await _connectInteractivelyWithPkce(
-              clientId: clientId,
-              redirectUri: redirectUri,
-              scopes: effectiveScopes,
-              tokenManager: tokenManager,
-            )
-          : await provider.client.connect(context);
-      debugPrint(
-          'OneDriveProvider.connect: interactive login result => $interactiveConnected');
-      if (interactiveConnected == false) {
+      if (Platform.isAndroid || Platform.isIOS) {
+        final interactiveCredentials =
+            await provider._connectInteractivelyWithPkce(
+          scopes: effectiveScopes,
+        );
         debugPrint(
-            'OneDriveProvider: Interactive login failed or was cancelled for redirectUri=$redirectUri');
-        return null; // User cancelled or login failed.
+            'OneDriveProvider.connect: interactive mobile login result => ${interactiveCredentials != null}');
+        if (interactiveCredentials == null) {
+          debugPrint(
+              'OneDriveProvider: Interactive login was cancelled for redirectUri=$redirectUri');
+          return null;
+        }
+      } else {
+        final interactiveConnected = await provider.client.connect(context);
+        debugPrint(
+            'OneDriveProvider.connect: interactive desktop login result => $interactiveConnected');
+        if (!interactiveConnected) {
+          debugPrint(
+              'OneDriveProvider: Interactive login failed or was cancelled for redirectUri=$redirectUri');
+          return null;
+        }
       }
+
+      try {
+        await provider._verifyAuthenticatedSession(stage: 'interactive-login');
+      } catch (error) {
+        debugPrint(
+            'OneDriveProvider.connect: interactive login verification failed, clearing stored session. error=$error');
+        await provider._clearStoredSession();
+        rethrow;
+      }
+
       provider._isAuthenticated = true;
       debugPrint("OneDriveProvider: Interactive login successful.");
       return provider;
@@ -111,11 +253,8 @@ class OneDriveProvider extends CloudStorageProvider {
     }
   }
 
-  static Future<bool> _connectInteractivelyWithPkce({
-    required String clientId,
-    required String redirectUri,
+  Future<oauth2.Credentials?> _connectInteractivelyWithPkce({
     required String scopes,
-    required ITokenManager tokenManager,
   }) async {
     final redirect = Uri.parse(redirectUri);
     final codeVerifier = _generateCodeVerifier();
@@ -143,36 +282,100 @@ class OneDriveProvider extends CloudStorageProvider {
           'OneDriveProvider._connectInteractivelyWithPkce: callbackUrl=$callbackUrl');
 
       final callbackUri = Uri.parse(callbackUrl);
-      if (callbackUri.scheme != redirect.scheme ||
-          callbackUri.host != redirect.host ||
-          callbackUri.path != redirect.path) {
+      final callbackMatches = callbackTargetMatches(
+        redirect: redirect,
+        callback: callbackUri,
+      );
+      debugPrint(
+          'OneDriveProvider._connectInteractivelyWithPkce: callback scheme=${callbackUri.scheme} host=${callbackUri.host} path=${callbackUri.path} expectedScheme=${redirect.scheme} expectedHost=${redirect.host} expectedPath=${redirect.path} matches=$callbackMatches');
+      if (!callbackMatches) {
         debugPrint(
             'OneDriveProvider._connectInteractivelyWithPkce: unexpected callback target ${callbackUri.scheme}://${callbackUri.host}${callbackUri.path} expected ${redirect.scheme}://${redirect.host}${redirect.path}');
-        return false;
+        throw OneDriveAuthException(
+          OneDriveAuthFailureCode.callbackMismatch,
+          'Unexpected OneDrive callback target for redirectUri=$redirectUri',
+        );
       }
 
       final client = await grant.handleAuthorizationResponse(
         callbackUri.queryParameters,
       );
-      await tokenManager.saveTokenResp(client.credentials);
+      await _persistCredentials(
+        client.credentials,
+        reason: 'interactive-login',
+      );
       debugPrint(
           'OneDriveProvider._connectInteractivelyWithPkce: token exchange succeeded');
-      return true;
+      return client.credentials;
     } on PlatformException catch (error) {
+      if (error.code == OneDrive.errCANCELED) {
+        debugPrint(
+            'OneDriveProvider._connectInteractivelyWithPkce: user cancelled auth flow');
+        return null;
+      }
       debugPrint(
           'OneDriveProvider._connectInteractivelyWithPkce: platform exception code=${error.code} message=${error.message}');
-      return false;
+      throw OneDriveAuthException(
+        OneDriveAuthFailureCode.tokenExchangeFailed,
+        'OneDrive interactive login failed before token exchange completed.',
+        cause: error,
+      );
     } on oauth2.AuthorizationException catch (error) {
       debugPrint(
           'OneDriveProvider._connectInteractivelyWithPkce: authorization exception error=${error.error} description=${error.description}');
-      return false;
+      throw OneDriveAuthException(
+        OneDriveAuthFailureCode.tokenExchangeFailed,
+        'OneDrive authorization failed: ${error.error}',
+        cause: error,
+      );
     } catch (error, stackTrace) {
       debugPrint(
           'OneDriveProvider._connectInteractivelyWithPkce: exception $error');
       debugPrint(
           'OneDriveProvider._connectInteractivelyWithPkce: stackTrace $stackTrace');
+      throw OneDriveAuthException(
+        OneDriveAuthFailureCode.tokenExchangeFailed,
+        'Unexpected OneDrive interactive auth failure.',
+        cause: error,
+      );
+    }
+  }
+
+  @visibleForTesting
+  static bool callbackTargetMatches({
+    required Uri redirect,
+    required Uri callback,
+  }) {
+    if (callback.scheme != redirect.scheme) {
       return false;
     }
+
+    return _normalizedCallbackHost(callback) ==
+            _normalizedCallbackHost(redirect) &&
+        _normalizedCallbackPath(callback) ==
+            _normalizedCallbackPath(redirect);
+  }
+
+  static String _normalizedCallbackHost(Uri uri) {
+    if (uri.host.isNotEmpty) {
+      return uri.host;
+    }
+
+    final segments = uri.pathSegments.where((segment) => segment.isNotEmpty);
+    if (segments.isEmpty) {
+      return '';
+    }
+
+    return segments.first;
+  }
+
+  static String _normalizedCallbackPath(Uri uri) {
+    final segments =
+        uri.pathSegments.where((segment) => segment.isNotEmpty).toList();
+    if (uri.host.isEmpty && segments.isNotEmpty) {
+      return segments.skip(1).join('/');
+    }
+    return segments.join('/');
   }
 
   static String _generateCodeVerifier() {
@@ -262,6 +465,7 @@ class OneDriveProvider extends CloudStorageProvider {
   }) {
     return _executeRequest(
       () async {
+        await _ensureClientReadyForPluginRequest();
         final response = await client.pull(remotePath,
             isAppFolder:
                 MultiCloudStorage.cloudAccess == CloudAccessType.appStorage);
@@ -293,6 +497,7 @@ class OneDriveProvider extends CloudStorageProvider {
   }) {
     return _executeRequest(
       () async {
+        await _ensureClientReadyForPluginRequest();
         final file = File(localPath);
         final bytes = await file.readAsBytes();
         // The `isAppFolder` flag directs the upload to the special "App Root" folder.
@@ -313,6 +518,7 @@ class OneDriveProvider extends CloudStorageProvider {
   Future<void> deleteFile(String path) {
     return _executeRequest(
       () async {
+        await _ensureClientReadyForPluginRequest();
         final response = await client.deleteFile(path,
             isAppFolder:
                 MultiCloudStorage.cloudAccess == CloudAccessType.appStorage);
@@ -329,6 +535,7 @@ class OneDriveProvider extends CloudStorageProvider {
   Future<void> createDirectory(String path) {
     return _executeRequest(
       () async {
+        await _ensureClientReadyForPluginRequest();
         final response = await client.createDirectory(path,
             isAppFolder:
                 MultiCloudStorage.cloudAccess == CloudAccessType.appStorage);
@@ -452,20 +659,12 @@ class OneDriveProvider extends CloudStorageProvider {
   Future<bool> tokenExpired() async {
     if (!_isAuthenticated) return true;
     try {
-      // Check token validity by making a lightweight, authenticated API call.
-      // A successful call means the token is valid.
-      final _ = await _executeRequest(
-        () => client.listFiles(
-          '/',
-          isAppFolder:
-              MultiCloudStorage.cloudAccess == CloudAccessType.appStorage,
-        ),
-        operation: 'tokenExpiredCheck',
-      );
+      await _verifyAuthenticatedSession(stage: 'token-expired-check');
       return false; // Success means token is not expired.
     } catch (e) {
       // Any exception here implies the token is invalid or expired.
       // The error is already logged by _executeRequest.
+      _isAuthenticated = false;
       return true;
     }
   }
@@ -476,27 +675,22 @@ class OneDriveProvider extends CloudStorageProvider {
     debugPrint(
         'OneDriveProvider.logout: start isAuthenticated=$_isAuthenticated redirectUri=$redirectUri');
     final cookieManager = CookieManager.instance();
+    var disconnected = false;
     if (_isAuthenticated) {
       try {
-        // 1. Disconnect the client to clear local tokens.
         await client.disconnect();
+        disconnected = true;
         debugPrint('OneDriveProvider.logout: client.disconnect() completed');
-        _isAuthenticated = false;
-        // 2. Clear all WebView cookies to ensure a fresh login prompt on the next connect attempt.
-        await cookieManager.deleteAllCookies();
-        debugPrint(
-            'OneDriveProvider.logout: web cookies cleared after disconnect');
-        return true;
       } catch (error) {
         debugPrint('OneDriveProvider.logout: error during logout $error');
-        return false;
       }
     }
-    // Ensure cookies are cleared even if the client was already disconnected.
+
+    await _clearStoredSession();
+    _isAuthenticated = false;
     await cookieManager.deleteAllCookies();
-    debugPrint(
-        'OneDriveProvider.logout: already disconnected, cleared web cookies only');
-    return false;
+    debugPrint('OneDriveProvider.logout: cleared stored credentials and web cookies');
+    return disconnected;
   }
 
   /// Generates a shareable link for the file or directory at the [path].
@@ -703,18 +897,163 @@ class OneDriveProvider extends CloudStorageProvider {
 
   /// Retrieves the current access token from the underlying token manager.
   Future<String> _getAccessToken() async {
-    final accessToken = await DefaultTokenManager(
-      tokenEndpoint: OneDrive.tokenEndpoint,
-      clientID: client.clientID,
-      redirectURL: client.redirectURL,
-      scope: client.scopes,
-    ).getAccessToken();
+    final storedCredentials = await _credentialStore.load(
+      clientId: clientId,
+      redirectUri: redirectUri,
+    );
+    if (storedCredentials != null) {
+      final usableCredentials = await _ensureUsableCredentials(
+        storedCredentials,
+        stage: 'get-access-token',
+      );
+      if (usableCredentials != null) {
+        final credentialsChanged =
+            usableCredentials.accessToken != storedCredentials.accessToken ||
+                usableCredentials.refreshToken !=
+                    storedCredentials.refreshToken ||
+                usableCredentials.expiration != storedCredentials.expiration;
+        if (credentialsChanged) {
+          await _persistCredentials(
+            usableCredentials,
+            reason: 'get-access-token-refresh',
+          );
+        } else {
+          await _tokenManager.saveTokenResp(usableCredentials);
+        }
+        return usableCredentials.accessToken;
+      }
+      await _credentialStore.clear(
+        clientId: clientId,
+        redirectUri: redirectUri,
+      );
+    }
+
+    final accessToken = await _tokenManager.getAccessToken();
 
     if (accessToken == null || accessToken.isEmpty) {
-      throw Exception(
-          'Failed to retrieve a valid access token. Please re-authenticate.');
+      throw OneDriveAuthException(
+        OneDriveAuthFailureCode.tokenCacheUnavailable,
+        'Failed to retrieve a valid OneDrive access token.',
+      );
     }
     return accessToken;
+  }
+
+  Future<bool> _restoreOwnedSession() async {
+    final storedCredentials = await _credentialStore.load(
+      clientId: clientId,
+      redirectUri: redirectUri,
+    );
+    if (storedCredentials == null) {
+      debugPrint('OneDriveProvider._restoreOwnedSession: no stored credentials');
+      return false;
+    }
+
+    debugPrint(
+        'OneDriveProvider._restoreOwnedSession: found stored credentials expired=${storedCredentials.isExpired} canRefresh=${storedCredentials.canRefresh}');
+    final usableCredentials = await _ensureUsableCredentials(
+      storedCredentials,
+      stage: 'restore-owned-session',
+    );
+    if (usableCredentials == null) {
+      debugPrint(
+          'OneDriveProvider._restoreOwnedSession: stored credentials were unusable, clearing them');
+      await _credentialStore.clear(clientId: clientId, redirectUri: redirectUri);
+      return false;
+    }
+
+    await _persistCredentials(
+      usableCredentials,
+      persistOwnedCredentials: false,
+      reason: 'restore-owned-session',
+    );
+    return true;
+  }
+
+  Future<void> _persistCredentials(
+    oauth2.Credentials credentials, {
+    required String reason,
+    bool persistOwnedCredentials = true,
+  }) async {
+    if (persistOwnedCredentials) {
+      await _credentialStore.save(
+        clientId: clientId,
+        redirectUri: redirectUri,
+        credentials: credentials,
+      );
+    }
+    await _tokenManager.saveTokenResp(credentials);
+    final immediateAccessToken = await _tokenManager.getAccessToken();
+    debugPrint(
+        'OneDriveProvider._persistCredentials: reason=$reason expiration=${credentials.expiration} hasRefresh=${credentials.refreshToken?.isNotEmpty == true} immediateTokenAvailable=${immediateAccessToken?.isNotEmpty == true}');
+  }
+
+  Future<oauth2.Credentials?> _ensureUsableCredentials(
+    oauth2.Credentials credentials, {
+    required String stage,
+  }) async {
+    if (!credentials.isExpired) {
+      return credentials;
+    }
+
+    if (!credentials.canRefresh) {
+      debugPrint(
+          'OneDriveProvider._ensureUsableCredentials: stage=$stage expired credentials cannot be refreshed');
+      return null;
+    }
+
+    debugPrint(
+        'OneDriveProvider._ensureUsableCredentials: stage=$stage refreshing expired credentials');
+    final refreshClient = oauth2.Client(
+      credentials,
+      identifier: clientId,
+      basicAuth: false,
+    );
+    try {
+      await refreshClient.refreshCredentials();
+      return refreshClient.credentials;
+    } catch (error, stackTrace) {
+      debugPrint(
+          'OneDriveProvider._ensureUsableCredentials: refresh failed at stage=$stage error=$error');
+      debugPrint(
+          'OneDriveProvider._ensureUsableCredentials: refresh stackTrace=$stackTrace');
+      return null;
+    } finally {
+      refreshClient.close();
+    }
+  }
+
+  Future<void> _verifyAuthenticatedSession({required String stage}) async {
+    final accessToken = await _getAccessToken();
+    debugPrint(
+        'OneDriveProvider._verifyAuthenticatedSession: stage=$stage tokenAvailable=${accessToken.isNotEmpty}');
+    final response = await http.get(
+      Uri.parse('https://graph.microsoft.com/v1.0/me? 24select=id'),
+      headers: {'Authorization': 'Bearer $accessToken'},
+    );
+    debugPrint(
+        'OneDriveProvider._verifyAuthenticatedSession: stage=$stage graphStatus=${response.statusCode}');
+    if (response.statusCode != 200) {
+      throw OneDriveAuthException(
+        OneDriveAuthFailureCode.graphProbeFailed,
+        'OneDrive Graph probe failed at $stage with status ${response.statusCode}',
+        cause: response.body,
+      );
+    }
+  }
+
+  Future<void> _ensureClientReadyForPluginRequest() async {
+    final accessToken = await _getAccessToken();
+    debugPrint(
+        'OneDriveProvider._ensureClientReadyForPluginRequest: accessTokenAvailable=${accessToken.isNotEmpty}');
+  }
+
+  Future<void> _clearStoredSession() async {
+    await _tokenManager.clearStoredToken();
+    await _credentialStore.clear(
+      clientId: clientId,
+      redirectUri: redirectUri,
+    );
   }
 
   /// Encodes a URL into a Base64 string for use in API calls.
